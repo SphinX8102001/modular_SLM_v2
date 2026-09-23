@@ -1,6 +1,10 @@
 """tests/test_pipeline.py — placeholder test suite (round 2)."""
 
 import inspect
+import json
+import subprocess
+import sys
+import numpy as np
 import pytest
 import src
 import src.config as config
@@ -422,3 +426,235 @@ class TestEvaluatorRound2:
         # 3. Empty list
         with pytest.raises(ValueError):
             evaluator.compute_metrics([])
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Round-3: SphericalKMeans and EmbeddingRouter Tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestSphericalKMeansRound3:
+    """Verify Round 3 SphericalKMeans clustering and mathematical invariants."""
+
+    def test_clustering_well_separated_groups(self) -> None:
+        rng = np.random.RandomState(42)
+        # 3 groups around unit coordinate axes
+        g1 = np.array([1.0, 0.0, 0.0]) + rng.randn(15, 3) * 0.05
+        g2 = np.array([0.0, 1.0, 0.0]) + rng.randn(15, 3) * 0.05
+        g3 = np.array([0.0, 0.0, 1.0]) + rng.randn(15, 3) * 0.05
+        X = np.vstack([g1, g2, g3])
+
+        km = router.SphericalKMeans(n_clusters=3, random_state=42).fit(X)
+        preds = km.predict(X)
+
+        # Centroids must have unit norm
+        centroid_norms = np.linalg.norm(km.centroids_, axis=1)
+        assert np.allclose(centroid_norms, 1.0)
+
+        # 3 well-separated groups are recovered (assignment matches true grouping up to permutation)
+        assert len(set(preds[:15])) == 1
+        assert len(set(preds[15:30])) == 1
+        assert len(set(preds[30:45])) == 1
+        assert len({preds[0], preds[15], preds[30]}) == 3
+
+        # predict_one == predict[0]
+        for i in range(len(X)):
+            assert km.predict_one(X[i]) == preds[i]
+
+    def test_reproducibility_and_data_ordering(self) -> None:
+        rng = np.random.RandomState(123)
+        g1 = np.array([1.0, 0.0, 0.0]) + rng.randn(10, 3) * 0.05
+        g2 = np.array([0.0, 1.0, 0.0]) + rng.randn(10, 3) * 0.05
+        g3 = np.array([0.0, 0.0, 1.0]) + rng.randn(10, 3) * 0.05
+        X = np.vstack([g1, g2, g3])
+
+        # Same random_state gives identical centroids
+        km1 = router.SphericalKMeans(n_clusters=3, random_state=42).fit(X)
+        km2 = router.SphericalKMeans(n_clusters=3, random_state=42).fit(X)
+        assert np.allclose(km1.centroids_, km2.centroids_)
+
+        # Different data orderings still recover the groups
+        perm = np.random.RandomState(99).permutation(len(X))
+        X_shuffled = X[perm]
+        true_labels = np.array([0] * 10 + [1] * 10 + [2] * 10)[perm]
+
+        km_shuffled = router.SphericalKMeans(n_clusters=3, random_state=42).fit(X_shuffled)
+        preds_shuffled = km_shuffled.predict(X_shuffled)
+
+        for true_group in [0, 1, 2]:
+            assigned_labels = preds_shuffled[true_labels == true_group]
+            assert len(set(assigned_labels)) == 1
+
+    def test_validation_errors(self) -> None:
+        km = router.SphericalKMeans(n_clusters=3, random_state=42)
+
+        # RuntimeError when predicting before fit
+        with pytest.raises(RuntimeError):
+            km.predict(np.ones((5, 3)))
+        with pytest.raises(RuntimeError):
+            km.predict_one(np.ones(3))
+
+        # ValueError for 1-D X
+        with pytest.raises(ValueError):
+            km.fit(np.array([1.0, 2.0, 3.0]))
+
+        # ValueError for n_samples < n_clusters
+        with pytest.raises(ValueError):
+            km.fit(np.ones((2, 3)))
+
+        # ValueError for zero-norm rows
+        X_zero = np.array([[1.0, 0.0], [0.0, 0.0], [0.5, 0.5]])
+        with pytest.raises(ValueError):
+            km.fit(X_zero)
+
+
+class TestEmbeddingRouterRound3:
+    """Verify Round 3 EmbeddingRouter calibration, routing, serialization, and error handling."""
+
+    @staticmethod
+    def _fake_embed(texts: list[str]) -> np.ndarray:
+        vecs = []
+        for t in texts:
+            if t.startswith("math:"):
+                base = np.array([1.0, 0.0, 0.0])
+            elif t.startswith("code:"):
+                base = np.array([0.0, 1.0, 0.0])
+            elif t.startswith("gen:"):
+                base = np.array([0.0, 0.0, 1.0])
+            else:
+                base = np.array([0.577, 0.577, 0.577])
+            h = sum(ord(c) for c in t)
+            noise = np.array([np.sin(h), np.cos(h), np.sin(h * 2)]) * 0.02
+            vec = base + noise
+            vec /= np.linalg.norm(vec)
+            vecs.append(vec)
+        return np.array(vecs, dtype=np.float64)
+
+    def test_calibration_and_routing(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        items = (
+            [{"id": f"m{i}", "question": f"math: problem {i}", "category": "math"} for i in range(12)]
+            + [{"id": f"c{i}", "question": f"code: task {i}", "category": "code"} for i in range(12)]
+            + [{"id": f"g{i}", "question": f"gen: query {i}", "category": "general"} for i in range(12)]
+        )
+
+        score_calls = [0]
+
+        def fake_score_fn(item: dict, role: str) -> float:
+            score_calls[0] += 1
+            if item["category"] == "math":
+                return 1.0 if role == "math" else (0.5 if role == "general" else 0.0)
+            elif item["category"] == "code":
+                return 1.0 if role == "code" else (0.5 if role == "general" else 0.0)
+            else:
+                return 1.0 if role == "general" else 0.0
+
+        r = router.EmbeddingRouter("mock-model", n_clusters=3, seed=42)
+        monkeypatch.setattr(r, "_embed", self._fake_embed)
+
+        # min_cluster_warn=15 ensures warning is emitted and recorded since each cluster has 12 items
+        with pytest.warns(UserWarning):
+            calib = r.calibrate(items, fake_score_fn, min_cluster_warn=15)
+
+        # Documented keys in returned dict
+        expected_keys = {
+            "n_items",
+            "cluster_sizes",
+            "capability_matrix",
+            "assignment",
+            "cluster_category_counts",
+            "item_scores",
+            "warnings",
+        }
+        assert set(calib.keys()) == expected_keys
+        assert calib["n_items"] == len(items)
+        assert sum(calib["cluster_sizes"]) == len(items)
+        assert len(calib["warnings"]) > 0
+
+        # score_fn called exactly len(items) * len(ROLES) times
+        assert score_calls[0] == len(items) * len(config.ROLES)
+
+        # assignment maps math cluster to math, code to code, gen to general
+        assigned_roles = set(calib["assignment"].values())
+        assert assigned_roles == {"math", "code", "general"}
+
+        # route and route_with_cluster
+        q_math = "math: what is 2+2"
+        q_code = "code: write a quicksort"
+        q_gen = "gen: capital of France"
+        assert r.route(q_math) == "math"
+        assert r.route(q_code) == "code"
+        assert r.route(q_gen) == "general"
+
+        assert r.route(q_math) == r.route_with_cluster(q_math)[0]
+        assert r.route(q_code) == r.route_with_cluster(q_code)[0]
+        assert r.route(q_gen) == r.route_with_cluster(q_gen)[0]
+
+        # Save and load roundtrip
+        save_file = tmp_path / "router_state" / "router.json"
+        r.save(save_file)
+
+        # Verify saved file parses with json.loads and has no pickle artifacts
+        raw_content = save_file.read_text(encoding="utf-8")
+        parsed_json = json.loads(raw_content)
+        assert parsed_json["schema_version"] == 1
+        assert "centroids" in parsed_json
+
+        # Load router
+        loaded_router = router.EmbeddingRouter.load(save_file)
+        monkeypatch.setattr(loaded_router, "_embed", self._fake_embed)
+
+        assert loaded_router.assignment_ == r.assignment_
+        assert loaded_router.route(q_math) == "math"
+        assert loaded_router.route(q_code) == "code"
+        assert loaded_router.route(q_gen) == "general"
+
+    def test_tie_break_rule(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When specialist and generalist have equal scores, generalist must win."""
+        items = (
+            [{"id": f"m{i}", "question": f"math: problem {i}", "category": "math"} for i in range(12)]
+            + [{"id": f"c{i}", "question": f"code: task {i}", "category": "code"} for i in range(12)]
+            + [{"id": f"g{i}", "question": f"gen: query {i}", "category": "general"} for i in range(12)]
+        )
+
+        def tie_score_fn(item: dict, role: str) -> float:
+            # Everyone scores 0.8 everywhere -> tie between general and specialists
+            return 0.8
+
+        r = router.EmbeddingRouter("mock-model", n_clusters=3, seed=42)
+        monkeypatch.setattr(r, "_embed", self._fake_embed)
+        calib = r.calibrate(items, tie_score_fn, min_cluster_warn=10)
+
+        # All clusters should fall back to general
+        for c in range(3):
+            assert calib["assignment"][c] == "general"
+
+    def test_errors_and_edge_cases(self, tmp_path: Path) -> None:
+        uncalibrated = router.EmbeddingRouter("mock-model", n_clusters=3, seed=42)
+
+        # route/save before calibrate raise RuntimeError
+        with pytest.raises(RuntimeError):
+            uncalibrated.route("query")
+        with pytest.raises(RuntimeError):
+            uncalibrated.route_with_cluster("query")
+        with pytest.raises(RuntimeError):
+            uncalibrated.save(tmp_path / "never.json")
+
+        # calibrate with empty or too short val_items raises ValueError
+        with pytest.raises(ValueError):
+            uncalibrated.calibrate([], lambda it, ro: 1.0)
+        with pytest.raises(ValueError):
+            uncalibrated.calibrate([{"id": "1", "question": "q"}], lambda it, ro: 1.0)
+
+        # load with wrong schema_version raises ValueError
+        bad_version_file = tmp_path / "bad_version.json"
+        bad_version_file.write_text(json.dumps({"schema_version": 999}), encoding="utf-8")
+        with pytest.raises(ValueError):
+            router.EmbeddingRouter.load(bad_version_file)
+
+    def test_import_hygiene(self) -> None:
+        """Verify that importing src.router loads neither torch, transformers, nor sklearn."""
+        code = (
+            "import sys; import src.router; "
+            "print('sentence_transformers' in sys.modules, 'torch' in sys.modules, 'sklearn' in sys.modules)"
+        )
+        out = subprocess.check_output([sys.executable, "-c", code], text=True).strip()
+        assert out == "False False False"
