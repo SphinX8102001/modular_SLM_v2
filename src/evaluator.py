@@ -182,27 +182,38 @@ def verify_mcq_letter(response: str, answer: str) -> bool:
     """Return True if *response* selects the correct MCQ letter (A/B/C/D).
 
     Ladder, first hit wins:
-    (a) \\boxed{X}
-    (b) "answer is X" / "answer: X" / "correct option is X"
-    (c) whole stripped response is just the letter (e.g. "B", "(B)", "B.", "B)")
+    (a) \\boxed{X} with optional LaTeX text wrappers and parentheses.
+    (b) Key phrases: "answer is", "answer:", "correct option is", "correct answer is".
+        Phrase part is case-insensitive, but letter matching is case-sensitive:
+        only parenthesised letter \\(([A-Da-d])\\) or bare UPPERCASE letter ([A-D])(?![A-Za-z0-9]).
+    (c) Whole stripped response is just the letter (e.g. "B", "(B)", "B.", "B)").
     """
     target = answer.strip().upper()
 
-    # (a) \boxed{X}
+    # (a) \boxed{X}: strip $ and whitespace, then fullmatch optional wrapper,
+    # optional parens, one letter A-D (either case), and optional closing }.
+    # If the box does not fully match, fall through to the next rule.
     boxed = extract_last_boxed(response)
     if boxed is not None:
-        m = re.search(r"\(?([A-Da-d])\)?", boxed)
-        if m:
-            return m.group(1).upper() == target
+        boxed_clean = boxed.strip().strip("$").strip()
+        boxed_pattern = re.compile(
+            r"(?:\\(?:text|textbf|mathrm|mathbf|mathit)\{)?\s*\(?([A-Da-d])\)?\s*\}?"
+        )
+        m_boxed = boxed_pattern.fullmatch(boxed_clean)
+        if m_boxed:
+            return m_boxed.group(1).upper() == target
 
-    # (b) Specific key phrases
+    # (b) Specific key phrases: "answer is", "answer:", "correct option is", "correct answer is"
+    # Scoped (?i:...) for phrase case-insensitivity, while letter matching is case-sensitive.
+    # Note: "The answer is A planet" remains ambiguous since bare "A" is followed by a space.
     phrase_pattern = re.compile(
-        r"(?:answer\s*(?:is|:)|correct\s+option\s*(?:is|:))\s*[*_`]*\(?([A-Da-d])\)?\.?[*_`]*",
-        re.IGNORECASE,
+        r"(?i:answer\s*(?:is|:)|correct\s+(?:option|answer)\s*(?:is|:))\s*[*_`]*\s*(?:\(([A-Da-d])\)|([A-D])(?![A-Za-z0-9]))"
     )
     phrase_matches = list(phrase_pattern.finditer(response))
     if phrase_matches:
-        return phrase_matches[-1].group(1).upper() == target
+        last_m = phrase_matches[-1]
+        letter = last_m.group(1) or last_m.group(2)
+        return letter.upper() == target
 
     # (c) Whole stripped response
     stripped = response.strip()
@@ -229,7 +240,7 @@ def verify_python_exec(
 
     code = matches[-1].strip()
     sentinel = uuid.uuid4().hex
-    script = code + "\n\n" + test_assertions + "\nprint(" + repr(sentinel) + ")\n"
+    script = code + "\n\n" + test_assertions + "\nprint('\\n' + " + repr(sentinel) + ")\n"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         script_path = os.path.join(tmpdir, "solution.py")
@@ -242,12 +253,13 @@ def verify_python_exec(
                 text=True,
                 timeout=timeout,
                 cwd=tmpdir,
+                stdin=subprocess.DEVNULL,
             )
         except subprocess.TimeoutExpired:
             return False, "timeout"
 
-    stdout_lines = proc.stdout.strip().splitlines()
-    last_line = stdout_lines[-1].strip() if stdout_lines else ""
+    non_empty_lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    last_line = non_empty_lines[-1] if non_empty_lines else ""
     if proc.returncode == 0 and last_line == sentinel:
         return True, ""
 

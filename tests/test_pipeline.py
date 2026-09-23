@@ -247,6 +247,21 @@ class TestEvaluatorRound2:
         # Wrong letter
         assert evaluator.verify_mcq_letter("The answer is B.", "C") is False
 
+        # Additional phrase tests & regressions:
+        assert evaluator.verify_mcq_letter("The answer is a planet.", "A") is False
+        assert evaluator.verify_mcq_letter("The answer is dog.", "D") is False
+        assert evaluator.verify_mcq_letter("The answer is a mammal", "A") is False
+        assert evaluator.verify_mcq_letter("The answer is (b)", "B") is True
+        assert evaluator.verify_mcq_letter("The answer is B.", "B") is True
+        assert evaluator.verify_mcq_letter("The answer is B.", "A") is False
+        assert evaluator.verify_mcq_letter("**Answer: C**", "C") is True
+
+        # Boxed LaTeX wrappers:
+        assert evaluator.verify_mcq_letter(r"\boxed{\textbf{D}}", "D") is True
+        assert evaluator.verify_mcq_letter(r"\boxed{\textbf{D}}", "B") is False
+        assert evaluator.verify_mcq_letter(r"\boxed{\mathrm{C}}", "C") is True
+        assert evaluator.verify_mcq_letter(r"\boxed{\mathrm{C}}", "A") is False
+
     def test_verify_python_exec_regressions(self) -> None:
         # Multi-line function with passing assertions
         code_pass = "```python\ndef add(a: int, b: int) -> int:\n    result = a + b\n    return result\n```"
@@ -285,6 +300,21 @@ class TestEvaluatorRound2:
         passed, err = evaluator.verify_python_exec("No code block here", "pass")
         assert passed is False
         assert err == "no code block"
+
+        # Correct code whose last output is print('abc', end='') -> True
+        code_no_newline = "```python\ndef solve():\n    print('abc', end='')\n    return 42\n```"
+        passed, err = evaluator.verify_python_exec(code_no_newline, "assert solve() == 42")
+        assert passed is True
+        assert err == ""
+
+        # Code calling input() -> False, finishing well under timeout
+        import time
+        code_input = "```python\ndef solve():\n    x = input()\n    return x\n```"
+        t0 = time.time()
+        passed, err = evaluator.verify_python_exec(code_input, "solve()", timeout=5)
+        elapsed = time.time() - t0
+        assert passed is False
+        assert elapsed < 2.0
 
     def test_score_response_dispatch(self) -> None:
         item_contains = {"verifier": "contains", "answer": ["Tokyo"]}
