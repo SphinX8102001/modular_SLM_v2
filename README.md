@@ -23,6 +23,15 @@ Does embedding-clustering-capability-profiling routing scale down effectively to
 
 \* SIZE CONFOUND: no Qwen2.5-Math variant below 1.5B exists.
 
+## Design Decisions
+
+- **Baseline = general specialist.** `baseline_score` is defined as `scores["general"]`; no separate baseline runner or extra generation per item is needed.
+- **Tie-break rule.** A specialist wins a cluster only if its calibration score is *strictly* greater than the generalist's; ties go to the generalist.
+- **score_fn callback.** Router calibration is decoupled from model runners via a `score_fn(item, response) → float` callback, so it can be unit-tested without loading any model weights.
+- **Val/test disjointness.** The pipeline asserts that val-set and test-set ids are strictly disjoint at startup (not enforced in the router).
+- **Separated output dirs.** Mock runs write only to `results_mock/` and `artifacts_mock/`; real runs write to `results/` and `artifacts/`.
+- **Known limitation.** K=3 clusters need not align with the 3 task domains; this is a research hypothesis, not a guarantee.
+
 ## Usage (coming in later rounds)
 
 ```bash

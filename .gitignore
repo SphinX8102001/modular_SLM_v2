@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+results/
+results_mock/
+artifacts/
+artifacts_mock/
+router_state/
+.venv/
