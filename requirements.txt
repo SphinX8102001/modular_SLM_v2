@@ -1,0 +1,10 @@
+torch
+transformers
+sentence-transformers
+scikit-learn
+scipy
+numpy
+pytest
+requests
+datasets
+accelerate
