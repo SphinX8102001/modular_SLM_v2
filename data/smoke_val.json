@@ -1,0 +1,90 @@
+[
+  {
+    "id": "sv_01",
+    "category": "general",
+    "question": "What is the capital of France?\nA) London\nB) Paris\nC) Berlin\nD) Madrid",
+    "verifier": "mcq_letter",
+    "answer": "B"
+  },
+  {
+    "id": "sv_02",
+    "category": "general",
+    "question": "What planet is known as the Red Planet?",
+    "verifier": "contains",
+    "answer": [
+      "Mars"
+    ]
+  },
+  {
+    "id": "sv_03",
+    "category": "general",
+    "question": "Which gas do plants absorb from the atmosphere for photosynthesis?\nA) Oxygen\nB) Nitrogen\nC) Carbon dioxide\nD) Helium",
+    "verifier": "mcq_letter",
+    "answer": "C"
+  },
+  {
+    "id": "sv_04",
+    "category": "general",
+    "question": "What is the primary official language spoken in Brazil?",
+    "verifier": "contains",
+    "answer": [
+      "Portuguese"
+    ]
+  },
+  {
+    "id": "sv_05",
+    "category": "math",
+    "question": "What is 15 + 27?",
+    "verifier": "numeric",
+    "answer": 42
+  },
+  {
+    "id": "sv_06",
+    "category": "math",
+    "question": "What is 12 * 8?",
+    "verifier": "numeric",
+    "answer": 96
+  },
+  {
+    "id": "sv_07",
+    "category": "math",
+    "question": "What is the value of 2^3?\nA) 6\nB) 8\nC) 9\nD) 16",
+    "verifier": "mcq_letter",
+    "answer": "B"
+  },
+  {
+    "id": "sv_08",
+    "category": "math",
+    "question": "What is 100 / 4?",
+    "verifier": "numeric",
+    "answer": 25
+  },
+  {
+    "id": "sv_09",
+    "category": "code",
+    "question": "Write a Python function `add(a: int, b: int) -> int` that returns the sum of `a` and `b`.",
+    "verifier": "python_exec",
+    "test_assertions": "assert add(1, 2) == 3\nassert add(-1, 1) == 0\nassert add(0, 0) == 0"
+  },
+  {
+    "id": "sv_10",
+    "category": "code",
+    "question": "Write a Python function `is_even(n: int) -> bool` that returns True if `n` is even, and False otherwise.",
+    "verifier": "python_exec",
+    "test_assertions": "assert is_even(4) is True\nassert is_even(7) is False\nassert is_even(0) is True"
+  },
+  {
+    "id": "sv_11",
+    "category": "code",
+    "question": "Write a Python function `reverse_string(s: str) -> str` that returns the reversed string.",
+    "verifier": "python_exec",
+    "test_assertions": "assert reverse_string('hello') == 'olleh'\nassert reverse_string('') == ''\nassert reverse_string('a') == 'a'"
+  },
+  {
+    "id": "sv_12",
+    "category": "code",
+    "question": "Write a Python function `square(x: int) -> int` that returns the square of `x`.",
+    "verifier": "python_exec",
+    "test_assertions": "assert square(3) == 9\nassert square(-4) == 16\nassert square(0) == 0"
+  }
+]

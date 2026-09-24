@@ -1,0 +1,69 @@
+[
+  {
+    "id": "st_01",
+    "category": "general",
+    "question": "What is the chemical symbol for water?",
+    "verifier": "contains",
+    "answer": [
+      "H2O"
+    ]
+  },
+  {
+    "id": "st_02",
+    "category": "general",
+    "question": "Which ocean is the largest on Earth?\nA) Atlantic Ocean\nB) Indian Ocean\nC) Arctic Ocean\nD) Pacific Ocean",
+    "verifier": "mcq_letter",
+    "answer": "D"
+  },
+  {
+    "id": "st_03",
+    "category": "general",
+    "question": "What currency is used in Japan?",
+    "verifier": "contains",
+    "answer": [
+      "Yen"
+    ]
+  },
+  {
+    "id": "st_04",
+    "category": "math",
+    "question": "What is 7 * 6?",
+    "verifier": "numeric",
+    "answer": 42
+  },
+  {
+    "id": "st_05",
+    "category": "math",
+    "question": "What is 50 - 18?",
+    "verifier": "numeric",
+    "answer": 32
+  },
+  {
+    "id": "st_06",
+    "category": "math",
+    "question": "What is the square root of 81?\nA) 7\nB) 8\nC) 9\nD) 10",
+    "verifier": "mcq_letter",
+    "answer": "C"
+  },
+  {
+    "id": "st_07",
+    "category": "code",
+    "question": "Write a Python function `multiply(a: int, b: int) -> int` that returns the product of `a` and `b`.",
+    "verifier": "python_exec",
+    "test_assertions": "assert multiply(2, 3) == 6\nassert multiply(-2, 3) == -6\nassert multiply(0, 5) == 0"
+  },
+  {
+    "id": "st_08",
+    "category": "code",
+    "question": "Write a Python function `is_positive(n: int) -> bool` that returns True if `n` is strictly greater than 0, and False otherwise.",
+    "verifier": "python_exec",
+    "test_assertions": "assert is_positive(5) is True\nassert is_positive(0) is False\nassert is_positive(-3) is False"
+  },
+  {
+    "id": "st_09",
+    "category": "code",
+    "question": "Write a Python function `double(n: int) -> int` that returns twice the value of `n`.",
+    "verifier": "python_exec",
+    "test_assertions": "assert double(4) == 8\nassert double(0) == 0\nassert double(-2) == -4"
+  }
+]

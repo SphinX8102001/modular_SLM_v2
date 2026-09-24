@@ -45,7 +45,7 @@ class HuggingFaceRunner(ModelRunner):
 
     def _raw_generate(self, query: str, system_prompt: str, role: str) -> str:
         """Tokenize, run forward pass, decode, and return the model's text output."""
-        raise NotImplementedError("round_4")
+        raise NotImplementedError("round_5")
 
     def is_mock(self) -> bool:
         """Return False — HuggingFaceRunner always uses real weights."""
@@ -70,7 +70,7 @@ class OllamaRunner(ModelRunner):
 
     def _raw_generate(self, query: str, system_prompt: str, role: str) -> str:
         """POST query to Ollama /api/generate and return the response text."""
-        raise NotImplementedError("round_4")
+        raise NotImplementedError("round_5")
 
     def is_mock(self) -> bool:
         """Return False — OllamaRunner requires a live Ollama server."""
@@ -97,7 +97,25 @@ class MockRunner(ModelRunner):
     @staticmethod
     def assert_mock_path(path_str: str) -> None:
         """Raise RuntimeError if the path points into results/ or artifacts/ and allows results_mock/ and artifacts_mock/."""
-        parts = set(Path(path_str).parts) | set(str(path_str).replace("\\", "/").split("/"))
+        p = Path(path_str)
+        root = Path(config.ROOT_DIR)
+        is_under_root = False
+        rel_path = None
+        try:
+            if p.is_relative_to(root):
+                is_under_root = True
+                rel_path = p.relative_to(root)
+            elif p.resolve().is_relative_to(root.resolve()):
+                is_under_root = True
+                rel_path = p.resolve().relative_to(root.resolve())
+        except Exception:
+            pass
+
+        if is_under_root and rel_path is not None:
+            parts = set(rel_path.parts) | set(str(rel_path).replace("\\", "/").split("/"))
+        else:
+            parts = set(p.parts) | set(str(path_str).replace("\\", "/").split("/"))
+
         if "results" in parts or "artifacts" in parts:
             raise RuntimeError(
                 f"Mock runs cannot write to production directories ('results' or 'artifacts'): {path_str}"
