@@ -1,5 +1,6 @@
-"""tests/test_pipeline.py — placeholder test suite (round 3)."""
+"""tests/test_pipeline.py — placeholder test suite (round 4)."""
 
+import argparse
 import inspect
 import json
 from pathlib import Path
@@ -9,9 +10,11 @@ import numpy as np
 import pytest
 import src
 import src.config as config
-import src.models as models
-import src.router as router
+import src.data as data
 import src.evaluator as evaluator
+import src.models as models
+import src.pipeline as pipeline
+import src.router as router
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -680,3 +683,350 @@ class TestEmbeddingRouterRound3:
         )
         out = subprocess.check_output([sys.executable, "-c", code], text=True).strip()
         assert out == "False False False"
+
+    def test_pipeline_import_hygiene(self) -> None:
+        """Verify that importing src.pipeline loads neither sentence_transformers, torch, nor sklearn."""
+        code = (
+            "import sys; import src.pipeline; "
+            "print('sentence_transformers' in sys.modules, 'torch' in sys.modules, 'sklearn' in sys.modules)"
+        )
+        out = subprocess.check_output([sys.executable, "-c", code], text=True).strip()
+        assert out == "False False False"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Round 4 tests: data, hash_embed, pipeline execution, CLI
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestRound4Data:
+    """Verify data loading, validation, and query construction."""
+
+    def test_smoke_files_load_and_disjoint(self) -> None:
+        val_path, test_path = data.dataset_paths("smoke")
+        val_items = data.load_items(val_path)
+        test_items = data.load_items(test_path)
+        data.assert_disjoint(val_items, test_items)
+
+        assert len(val_items) == 12
+        assert len(test_items) == 9
+
+        val_cats = [it["category"] for it in val_items]
+        test_cats = [it["category"] for it in test_items]
+        assert [val_cats.count(c) for c in ["general", "math", "code"]] == [4, 4, 4]
+        assert [test_cats.count(c) for c in ["general", "math", "code"]] == [3, 3, 3]
+
+        for it in val_items + test_items:
+            if it["verifier"] == "python_exec":
+                assert isinstance(it.get("test_assertions"), str)
+                assert it["test_assertions"].strip()
+            elif it["verifier"] == "numeric":
+                assert not isinstance(it.get("answer"), bool)
+                assert isinstance(it.get("answer"), (int, float))
+
+    def test_load_items_errors(self, tmp_path: Path) -> None:
+        # Unknown verifier
+        p_unknown = tmp_path / "unknown_verifier.json"
+        p_unknown.write_text(
+            json.dumps([{"id": "uv1", "category": "math", "question": "q?", "verifier": "magic", "answer": 1}]),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="unknown verifier"):
+            data.load_items(p_unknown)
+
+        # Missing answer
+        p_missing_ans = tmp_path / "missing_answer.json"
+        p_missing_ans.write_text(
+            json.dumps([{"id": "ma1", "category": "math", "question": "q?", "verifier": "numeric"}]),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="missing 'answer'"):
+            data.load_items(p_missing_ans)
+
+        # Bad category
+        p_bad_cat = tmp_path / "bad_cat.json"
+        p_bad_cat.write_text(
+            json.dumps([{"id": "bc1", "category": "history", "question": "q?", "verifier": "numeric", "answer": 1}]),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="invalid category"):
+            data.load_items(p_bad_cat)
+
+        # Duplicate ids inside file
+        p_dup = tmp_path / "dup_id.json"
+        p_dup.write_text(
+            json.dumps([
+                {"id": "dup_1", "category": "general", "question": "q1", "verifier": "contains", "answer": ["a"]},
+                {"id": "dup_1", "category": "general", "question": "q2", "verifier": "contains", "answer": ["b"]},
+            ]),
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="Duplicate item id"):
+            data.load_items(p_dup)
+
+        # assert_disjoint raises on overlap
+        items_val = [{"id": "shared_01", "category": "general", "question": "q1", "verifier": "contains", "answer": ["a"]}]
+        items_test = [{"id": "shared_01", "category": "math", "question": "q2", "verifier": "numeric", "answer": 2}]
+        with pytest.raises(ValueError, match="share ids"):
+            data.assert_disjoint(items_val, items_test)
+
+    def test_build_query(self) -> None:
+        numeric_item = {
+            "id": "m1",
+            "category": "math",
+            "question": "What is 2+2?",
+            "verifier": "numeric",
+            "answer": 4,
+        }
+        assert data.build_query(numeric_item) == f"What is 2+2?{config.NUMERIC_SUFFIX}"
+
+        other_item = {
+            "id": "g1",
+            "category": "general",
+            "question": "Capital of France?",
+            "verifier": "mcq_letter",
+            "answer": "B",
+        }
+        assert data.build_query(other_item) == "Capital of France?"
+
+
+class TestRound4HashEmbed:
+    """Verify deterministic bag-of-words hash embedding."""
+
+    def test_hash_embed_properties(self) -> None:
+        texts = ["hello world", "test query text"]
+        dim = 64
+        res = pipeline.hash_embed(texts, dim=dim)
+
+        assert res.shape == (2, dim)
+        assert res.dtype == np.float64
+        norms = np.linalg.norm(res, axis=1)
+        assert np.allclose(norms, 1.0)
+
+        # Deterministic across two calls
+        res_again = pipeline.hash_embed(texts, dim=dim)
+        assert np.array_equal(res, res_again)
+
+        # Identical texts give identical vectors
+        res_dup = pipeline.hash_embed(["same sentence", "same sentence"], dim=dim)
+        assert np.array_equal(res_dup[0], res_dup[1])
+
+        # Empty string still has unit norm
+        empty_res = pipeline.hash_embed([""], dim=config.EMBEDDING_DIM)
+        assert empty_res.shape == (1, config.EMBEDDING_DIM)
+        assert np.isclose(np.linalg.norm(empty_res[0]), 1.0)
+
+
+class TestRound4PipelineExecution:
+    """End-to-end mock execution, error handling, determinism, and CLI integration."""
+
+    @pytest.fixture(autouse=True)
+    def setup_dirs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.tmp_path = tmp_path
+        self.results_mock = tmp_path / "results_mock"
+        self.artifacts_mock = tmp_path / "artifacts_mock"
+        self.results_prod = tmp_path / "results"
+        self.artifacts_prod = tmp_path / "artifacts"
+        self.router_state_file = self.artifacts_prod / "router_state.json"
+
+        monkeypatch.setattr(config, "RESULTS_MOCK_DIR", self.results_mock)
+        monkeypatch.setattr(config, "ARTIFACTS_MOCK_DIR", self.artifacts_mock)
+        monkeypatch.setattr(config, "RESULTS_DIR", self.results_prod)
+        monkeypatch.setattr(config, "ARTIFACTS_DIR", self.artifacts_prod)
+        monkeypatch.setattr(config, "ROUTER_STATE_FILE", self.router_state_file)
+
+    def _default_args(self, **kwargs: Any) -> argparse.Namespace:
+        defaults: dict[str, Any] = {
+            "scale": "0.5b",
+            "backend": "huggingface",
+            "mock": True,
+            "limit": None,
+            "skip_calibration": False,
+            "seed": 7,
+            "benchmark": "smoke",
+        }
+        defaults.update(kwargs)
+        return argparse.Namespace(**defaults)
+
+    def test_full_mock_run_05b(self) -> None:
+        args = self._default_args(scale="0.5b")
+        ret = pipeline.run(args)
+        assert ret == 0
+
+        run_dir = self.results_mock / "0.5b_smoke_seed7"
+        assert run_dir.is_dir()
+
+        # All 5 files in run_dir + router_state.json in artifacts_mock
+        for fname in ["metrics.json", "records.json", "calibration.json", "generations.json", "run_config.json"]:
+            assert (run_dir / fname).is_file()
+        assert (self.artifacts_mock / "router_state.json").is_file()
+
+        # Records check
+        records = json.loads((run_dir / "records.json").read_text(encoding="utf-8"))
+        assert len(records) == 9
+        for r in records:
+            assert r["baseline_score"] == r["scores"]["general"]
+
+        # Run config checks (0.5b contains note, 1.5b does not)
+        cfg_05 = json.loads((run_dir / "run_config.json").read_text(encoding="utf-8"))
+        assert "size_confound_note" in cfg_05
+        assert cfg_05["size_confound_note"] == config.SIZE_CONFOUND_NOTE
+
+        args_15 = self._default_args(scale="1.5b")
+        ret_15 = pipeline.run(args_15)
+        assert ret_15 == 0
+        cfg_15 = json.loads((self.results_mock / "1.5b_smoke_seed7" / "run_config.json").read_text(encoding="utf-8"))
+        assert "size_confound_note" not in cfg_15
+        assert config.SIZE_CONFOUND_NOTE not in str(cfg_15)
+
+        # Nothing was written under non-mock dirs
+        assert not self.results_prod.exists()
+        assert not self.artifacts_prod.exists()
+
+    def test_determinism(self) -> None:
+        args1 = self._default_args(seed=7)
+        assert pipeline.run(args1) == 0
+        metrics1 = (self.results_mock / "0.5b_smoke_seed7" / "metrics.json").read_text(encoding="utf-8")
+
+        # Run again with same seed
+        args2 = self._default_args(seed=7)
+        assert pipeline.run(args2) == 0
+        metrics2 = (self.results_mock / "0.5b_smoke_seed7" / "metrics.json").read_text(encoding="utf-8")
+
+        assert metrics1 == metrics2
+
+    def test_limit(self) -> None:
+        args = self._default_args(limit=4)
+        assert pipeline.run(args) == 0
+        records = json.loads((self.results_mock / "0.5b_smoke_seed7" / "records.json").read_text(encoding="utf-8"))
+        assert len(records) == 4
+
+    def test_skip_calibration(self) -> None:
+        # First normal run to produce router_state.json
+        args_init = self._default_args()
+        assert pipeline.run(args_init) == 0
+        rec_init = json.loads((self.results_mock / "0.5b_smoke_seed7" / "records.json").read_text(encoding="utf-8"))
+        routes_init = [r["routed_specialist"] for r in rec_init]
+
+        # Second run with skip_calibration=True
+        args_skip = self._default_args(skip_calibration=True)
+        assert pipeline.run(args_skip) == 0
+        rec_skip = json.loads((self.results_mock / "0.5b_smoke_seed7" / "records.json").read_text(encoding="utf-8"))
+        routes_skip = [r["routed_specialist"] for r in rec_skip]
+
+        assert routes_skip == routes_init
+
+        # Without saved state returns 2
+        (self.artifacts_mock / "router_state.json").unlink()
+        assert pipeline.run(args_skip) == 2
+
+    def test_oracle_style_runner_factory(self) -> None:
+        val_items = data.load_items(data.dataset_paths("smoke")[0])
+        test_items = data.load_items(data.dataset_paths("smoke")[1])
+        all_items = {data.build_query(it): it for it in val_items + test_items}
+
+        class OracleRunner(models.ModelRunner):
+            def __init__(self, role: str) -> None:
+                self.role = role
+
+            def _raw_generate(self, query: str, system_prompt: str, role: str) -> str:
+                it = all_items.get(query)
+                if it is None:
+                    return "wrong"
+                if self.role == it["category"] or self.role == "general":
+                    verifier = it["verifier"]
+                    if verifier == "mcq_letter":
+                        return str(it["answer"])
+                    elif verifier == "numeric":
+                        return f"\\boxed{{{it['answer']}}}"
+                    elif verifier == "contains":
+                        return it["answer"][0]
+                    elif verifier == "python_exec":
+                        q = it["question"]
+                        if "add" in q:
+                            return "def add(a, b): return a + b"
+                        elif "is_even" in q:
+                            return "def is_even(n): return n % 2 == 0"
+                        elif "reverse_string" in q:
+                            return "def reverse_string(s): return s[::-1]"
+                        elif "square" in q:
+                            return "def square(x): return x * x"
+                        elif "multiply" in q:
+                            return "def multiply(a, b): return a * b"
+                        elif "is_positive" in q:
+                            return "def is_positive(n): return n > 0"
+                        elif "double" in q:
+                            return "def double(n): return n * 2"
+                        return "def func(*args): pass"
+                return "wrong"
+
+            def is_mock(self) -> bool:
+                return True
+
+        def oracle_factory(backend: str, model_id: str, role: str, scale: str, is_mock: bool) -> models.ModelRunner:
+            return OracleRunner(role=role)
+
+        args = self._default_args()
+        ret = pipeline.run(args, runner_factory=oracle_factory, embed_fn=pipeline.hash_embed)
+        assert ret == 0
+
+        metrics = json.loads((self.results_mock / "0.5b_smoke_seed7" / "metrics.json").read_text(encoding="utf-8"))
+        assert metrics["oracle"]["acc"] >= metrics["routed"]["acc"]
+        assert metrics["baseline"]["acc"] == metrics["always"]["general"]["acc"]
+
+    def test_overlapping_ids(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        val_f = self.tmp_path / "val_overlap.json"
+        test_f = self.tmp_path / "test_overlap.json"
+        shared_item = [{"id": "shared_01", "category": "general", "question": "q?", "verifier": "contains", "answer": ["a"]}]
+        val_f.write_text(json.dumps(shared_item), encoding="utf-8")
+        test_f.write_text(json.dumps(shared_item), encoding="utf-8")
+
+        monkeypatch.setattr(data, "dataset_paths", lambda b: (val_f, test_f))
+        args = self._default_args()
+        assert pipeline.run(args) == 2
+
+    def test_benchmark_real_missing_data(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        empty_dir = self.tmp_path / "empty_data_dir"
+        empty_dir.mkdir()
+        monkeypatch.setattr(config, "DATA_DIR", empty_dir)
+
+        args = self._default_args(benchmark="real")
+        assert pipeline.run(args) == 2
+
+    def test_mock_false_not_implemented(self) -> None:
+        args = self._default_args(mock=False, backend="huggingface")
+        ret = pipeline.run(args, embed_fn=pipeline.hash_embed)
+        assert ret == 2
+
+    def test_assert_mock_path_root_relative(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(config, "ROOT_DIR", Path("/home/u/results/proj"))
+
+        # Root-relative mock dir must not raise
+        models.MockRunner.assert_mock_path("/home/u/results/proj/results_mock/x.json")
+
+        # Root-relative prod dir must raise
+        with pytest.raises(RuntimeError):
+            models.MockRunner.assert_mock_path("/home/u/results/proj/results/x.json")
+
+        # Outside ROOT_DIR: existing behavior
+        with pytest.raises(RuntimeError):
+            models.MockRunner.assert_mock_path("/x/results/run.json")
+        models.MockRunner.assert_mock_path("/x/results_mock/run.json")
+
+    def test_cli_execution(self) -> None:
+        res = subprocess.run(
+            [sys.executable, "run_pipeline.py", "--scale", "0.5b", "--mock", "--seed", "7"],
+            cwd=str(config.ROOT_DIR),
+            capture_output=True,
+            text=True,
+        )
+        assert res.returncode == 0
+        assert "Routed accuracy" in res.stdout
+
+        res_real = subprocess.run(
+            [sys.executable, "run_pipeline.py", "--scale", "0.5b", "--mock", "--seed", "7", "--benchmark", "real"],
+            cwd=str(config.ROOT_DIR),
+            capture_output=True,
+            text=True,
+        )
+        assert res_real.returncode == 2
+        assert len(res_real.stderr.strip()) > 0

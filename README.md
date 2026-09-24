@@ -32,8 +32,25 @@ Does embedding-clustering-capability-profiling routing scale down effectively to
 - **Separated output dirs.** Mock runs write only to `results_mock/` and `artifacts_mock/`; real runs write to `results/` and `artifacts/`.
 - **Known limitation.** K=3 clusters need not align with the 3 task domains; this is a research hypothesis, not a guarantee.
 
-## Usage (coming in later rounds)
+## Usage
+
+Run the mock smoke pipeline end-to-end (no model downloads, CPU-only):
 
 ```bash
-python run_pipeline.py --scale 1.5b --mock --benchmark smoke
+python run_pipeline.py --scale 0.5b --mock --seed 7
 ```
+
+### Output Files
+
+Outputs are written to `results_mock/<scale>_<benchmark>_seed<seed>/` and `artifacts_mock/`:
+
+| Path / File | Description |
+|-------------|-------------|
+| `metrics.json` | Aggregated evaluation metrics: routed accuracy, baseline accuracy, delta, McNemar test p-value, Wilson CI, oracle accuracy, and routing counts. |
+| `records.json` | Per-test-item evaluation records: question item, routed specialist, per-role scores, and baseline score. |
+| `calibration.json` | Router calibration summary from the validation set (or `{"skipped": true}` when `--skip-calibration` is set). |
+| `generations.json` | Dump of raw text generations per item and role across val and test splits (`{"val": {...}, "test": {...}}`). |
+| `run_config.json` | Metadata and configuration of the run (CLI arguments, model registry entries, prompts, seed, version, git commit, python version, and size confound note). |
+| `artifacts_mock/router_state.json` | Persisted router state (cluster centroids, capability matrix, and specialist assignments). |
+
+> **Note**: `--mock` uses a deterministic hashed bag-of-words embedder (`hash_embed`) with no downloads and no model weights. Smoke run results validate pipeline plumbing and data flow only, and say nothing about true routing quality.

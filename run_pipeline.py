@@ -54,13 +54,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    """Parse arguments, print them, and exit. No pipeline logic in round 0."""
-    import src  # noqa: F401 — bare import check only
-
+    """Parse arguments, execute pipeline, and exit with status code."""
     parser = build_parser()
     args = parser.parse_args()
-    print(args)
-    sys.exit(0)
+    from src.pipeline import run
+
+    code = run(args)
+    sys.exit(code)
 
 
 if __name__ == "__main__":
