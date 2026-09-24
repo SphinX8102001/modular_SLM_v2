@@ -1,7 +1,8 @@
-"""tests/test_pipeline.py — placeholder test suite (round 2)."""
+"""tests/test_pipeline.py — placeholder test suite (round 3)."""
 
 import inspect
 import json
+from pathlib import Path
 import subprocess
 import sys
 import numpy as np
@@ -649,6 +650,27 @@ class TestEmbeddingRouterRound3:
         bad_version_file.write_text(json.dumps({"schema_version": 999}), encoding="utf-8")
         with pytest.raises(ValueError):
             router.EmbeddingRouter.load(bad_version_file)
+
+    def test_calibrate_duplicate_ids(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Calibrating with duplicate item IDs must raise ValueError and never call score_fn."""
+        items = [
+            {"id": "item1", "question": "math: 1+1", "category": "math"},
+            {"id": "item1", "question": "math: 2+2", "category": "math"},
+            {"id": "item2", "question": "code: pass", "category": "code"},
+        ]
+        score_calls = [0]
+
+        def fake_score_fn(item: dict, role: str) -> float:
+            score_calls[0] += 1
+            return 1.0
+
+        r = router.EmbeddingRouter("mock-model", n_clusters=3, seed=42)
+        monkeypatch.setattr(r, "_embed", self._fake_embed)
+
+        with pytest.raises(ValueError, match="Duplicate item id"):
+            r.calibrate(items, fake_score_fn)
+
+        assert score_calls[0] == 0
 
     def test_import_hygiene(self) -> None:
         """Verify that importing src.router loads neither torch, transformers, nor sklearn."""

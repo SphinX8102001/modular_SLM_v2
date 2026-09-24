@@ -170,9 +170,20 @@ class EmbeddingRouter:
         score_fn: Callable[[dict, str], float],
         min_cluster_warn: int = 10,
     ) -> dict:
-        """Build the Capability Profile Matrix S(cluster, specialist) from val data."""
+        """Build the Capability Profile Matrix S(cluster, specialist) from val data.
+
+        Raises ValueError if val_items is empty, shorter than n_clusters, or contains
+        duplicate item IDs (compared as str).
+        """
         if not val_items or len(val_items) < self.n_clusters:
             raise ValueError(f"val_items must contain at least n_clusters ({self.n_clusters}) items.")
+
+        seen_ids: set[str] = set()
+        for item in val_items:
+            item_id = str(item["id"])
+            if item_id in seen_ids:
+                raise ValueError(f"Duplicate item id found in val_items: {item_id!r}")
+            seen_ids.add(item_id)
 
         # 1. Embed questions and fit SphericalKMeans
         questions = [item["question"] for item in val_items]
