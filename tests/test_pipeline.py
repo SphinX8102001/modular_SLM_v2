@@ -1130,7 +1130,6 @@ class TestRound5Cache:
         assert c2.get("k1") == "hello"
 
     def test_truncated_last_line_skipped(self, tmp_path: Path) -> None:
-        import json as _json
         path = tmp_path / "cache.jsonl"
         # Write a valid line then a truncated/malformed line
         path.write_text(
@@ -1298,7 +1297,6 @@ class TestRound5PipelineBehaviour:
         assert pipeline.run(args, runner_factory=factory, embed_fn=pipeline.hash_embed) == 0
 
         # Change system prompt for 'math' only
-        original_math_prompt = config.SYSTEM_PROMPTS["math"]
         monkeypatch.setitem(config.SYSTEM_PROMPTS, "math", "CHANGED MATH PROMPT")
 
         factory2, events2 = self._spy_factory()
@@ -1404,6 +1402,40 @@ class TestRound5PipelineBehaviour:
 
         args = self._default_args()
         assert pipeline.run(args, runner_factory=crash_factory, embed_fn=pipeline.hash_embed) == 2
+
+    def test_cuda_device_run_dir_naming(self) -> None:
+        """A mock run with device='cuda' writes to the '_cuda' directory and a device='cpu' run does not; the two directories are different."""
+        args_cpu = self._default_args(device="cpu")
+        args_cuda = self._default_args(device="cuda")
+
+        assert pipeline.run(args_cpu, embed_fn=pipeline.hash_embed) == 0
+        assert pipeline.run(args_cuda, embed_fn=pipeline.hash_embed) == 0
+
+        cpu_dir = self.results_mock / "0.5b_smoke_seed7"
+        cuda_dir = self.results_mock / "0.5b_smoke_seed7_cuda"
+
+        assert cpu_dir != cuda_dir
+        assert cpu_dir.is_dir()
+        assert cuda_dir.is_dir()
+        assert (cpu_dir / "metrics.json").exists()
+        assert (cuda_dir / "metrics.json").exists()
+
+    def test_preflight_missing_torch_returns_2(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Monkeypatching importlib.util.find_spec to return None for 'torch' causes run(mock=False, backend='huggingface') to return 2."""
+        import importlib.util
+
+        real_find_spec = importlib.util.find_spec
+
+        def fake_find_spec(name: str, *args: Any, **kwargs: Any) -> Any:
+            if name == "torch":
+                return None
+            return real_find_spec(name, *args, **kwargs)
+
+        monkeypatch.setattr(importlib.util, "find_spec", fake_find_spec)
+
+        args = self._default_args(mock=False, backend="huggingface")
+        ret = pipeline.run(args)
+        assert ret == 2
 
     def test_import_hygiene_round5(self) -> None:
         """import src.models, src.pipeline leaves torch/transformers/sentence_transformers out of sys.modules."""

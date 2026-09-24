@@ -114,8 +114,8 @@ class HuggingFaceRunner(ModelRunner):
 
         if self.device == "cuda" and not torch.cuda.is_available():
             raise RuntimeError(
-                f"CUDA is not available on this machine. "
-                f"Re-run with --device cpu instead."
+                "CUDA is not available on this machine. "
+                "Re-run with --device cpu instead."
             )
 
         dtype_name = self.resolve_dtype_name(self.device, self.dtype)

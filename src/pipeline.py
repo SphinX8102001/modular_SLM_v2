@@ -12,8 +12,8 @@ Design decisions:
 
 from __future__ import annotations
 import hashlib
+import importlib.util
 import json
-from pathlib import Path
 import random
 import re
 import subprocess
@@ -76,15 +76,13 @@ def _preflight(args: Any) -> int | None:
         return 2
 
     if backend == "huggingface":
-        try:
-            import torch  # noqa: F401
-            import transformers  # noqa: F401
-        except ImportError as e:
-            sys.stderr.write(
-                f"Missing dependency: {e}. "
-                "Install dependencies with: pip install -r requirements.txt\n"
-            )
-            return 2
+        for mod in ("torch", "transformers"):
+            if importlib.util.find_spec(mod) is None:
+                sys.stderr.write(
+                    f"Missing dependency: No module named '{mod}'. "
+                    "Install dependencies with: pip install -r requirements.txt\n"
+                )
+                return 2
 
     return None
 
@@ -119,7 +117,10 @@ def run(
             artifacts_dir = config.ARTIFACTS_DIR
             state_path = config.ROUTER_STATE_FILE
 
-        run_dir = results_dir / f"{args.scale}_{args.benchmark}_seed{args.seed}"
+        dir_name = f"{args.scale}_{args.benchmark}_seed{args.seed}"
+        if getattr(args, "device", "cpu") == "cuda":
+            dir_name += "_cuda"
+        run_dir = results_dir / dir_name
 
         if args.mock:
             models.MockRunner.assert_mock_path(str(run_dir))
