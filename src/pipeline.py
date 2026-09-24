@@ -1,4 +1,14 @@
-"""src/pipeline.py — end-to-end routing pipeline execution (round 4)."""
+"""src/pipeline.py — end-to-end routing pipeline execution (round 5).
+
+Design decisions:
+- Role-major generation: for each role, load runner → generate all needed items
+  → unload runner. Only one model is in memory at a time.
+- Resumable via JSONL generation cache (<run_dir>/generation_cache.jsonl).
+  Re-run the same command to resume; delete the file to force a fresh run.
+- score_fn never triggers new generations after the pre-generation phase.
+- Preflight check (non-mock): validates torch/transformers availability before
+  any model is loaded or the embedding model is touched.
+"""
 
 from __future__ import annotations
 import hashlib
@@ -8,11 +18,13 @@ import random
 import re
 import subprocess
 import sys
+import time
 from typing import Any, Callable
 
 import numpy as np
 
 import src
+from src import cache as cache_module
 from src import config, data, evaluator, models, router
 
 
@@ -49,6 +61,34 @@ def hash_embed(texts: list[str], dim: int | None = None) -> np.ndarray:
     return np.array(vectors, dtype=np.float64)
 
 
+def _preflight(args: Any) -> int | None:
+    """Non-mock preflight checks; return exit code on failure, None on success."""
+    if getattr(args, "mock", False):
+        return None
+
+    backend = getattr(args, "backend", "huggingface")
+
+    if backend == "ollama":
+        sys.stderr.write(
+            "Ollama backend is not implemented yet (arrives in round 7). "
+            "Re-run with --backend huggingface.\n"
+        )
+        return 2
+
+    if backend == "huggingface":
+        try:
+            import torch  # noqa: F401
+            import transformers  # noqa: F401
+        except ImportError as e:
+            sys.stderr.write(
+                f"Missing dependency: {e}. "
+                "Install dependencies with: pip install -r requirements.txt\n"
+            )
+            return 2
+
+    return None
+
+
 def run(
     args: Any,
     runner_factory: Callable[..., models.ModelRunner] | None = None,
@@ -62,6 +102,8 @@ def run(
 
         if embed_fn is None and getattr(args, "mock", False):
             embed_fn = hash_embed
+
+        device = getattr(args, "device", "cpu")
 
         # Step a: Seed random and numpy
         random.seed(args.seed)
@@ -89,6 +131,17 @@ def run(
         test_items = data.load_items(test_path)
         data.assert_disjoint(val_items, test_items)
 
+        # val_limit handling (debugging only)
+        val_limit = getattr(args, "val_limit", None)
+        if val_limit is not None:
+            if val_limit < config.N_CLUSTERS:
+                sys.stderr.write(
+                    f"--val-limit {val_limit} is less than N_CLUSTERS={config.N_CLUSTERS}; "
+                    "the router cannot be calibrated with so few items.\n"
+                )
+                return 2
+            val_items = val_items[:val_limit]
+
         if getattr(args, "limit", None) is not None:
             test_items = test_items[: args.limit]
 
@@ -102,33 +155,109 @@ def run(
                 role,
                 args.scale,
                 args.mock,
+                device,
             )
 
-        # Step e: score_fn and response caching
-        score_cache: dict[tuple[str, str], float] = {}
-        generations: dict[str, dict[str, dict[str, str]]] = {"val": {}, "test": {}}
+        # Preflight (runs after dataset loading and runner creation, before embed/model)
+        preflight_code = _preflight(args)
+        if preflight_code is not None:
+            return preflight_code
+
+        # Initialise the persistent generation cache
+        run_dir.mkdir(parents=True, exist_ok=True)
+        cache_path = run_dir / "generation_cache.jsonl"
+        if args.mock:
+            models.MockRunner.assert_mock_path(str(cache_path))
+        gen_cache = cache_module.GenerationCache(cache_path)
+
+        # In-memory memo: (item_id, role) -> response
+        response_memo: dict[tuple[str, str], str] = {}
+
+        # Per-role timing stats
+        timing: dict[str, dict[str, Any]] = {
+            role: {"n_generated": 0, "n_cached": 0, "seconds": 0.0, "new_tokens": 0, "_has_tokens": False}
+            for role in config.ROLES
+        }
+
         val_id_set = {str(it["id"]) for it in val_items}
+        generations: dict[str, dict[str, dict[str, str]]] = {"val": {}, "test": {}}
+
+        def generate_response(runner: models.ModelRunner, item: dict, role: str) -> str:
+            """Cached generation: check mem cache → disk cache → generate."""
+            item_id = str(item["id"])
+            mem_key = (item_id, role)
+            if mem_key in response_memo:
+                return response_memo[mem_key]
+
+            system_prompt = config.SYSTEM_PROMPTS[role]
+            gen_settings = models.build_generation_kwargs(role)
+            query = data.build_query(item)
+            cache_key = cache_module.make_key(runner, role, system_prompt, gen_settings, query)
+
+            cached = gen_cache.get(cache_key)
+            if cached is not None:
+                timing[role]["n_cached"] += 1
+                response_memo[mem_key] = cached
+                split = "val" if item_id in val_id_set else "test"
+                if item_id not in generations[split]:
+                    generations[split][item_id] = {}
+                generations[split][item_id][role] = cached
+                return cached
+
+            t0 = time.perf_counter()
+            response = runner.generate(query, role)
+            elapsed = time.perf_counter() - t0
+
+            timing[role]["n_generated"] += 1
+            timing[role]["seconds"] += elapsed
+            new_toks = getattr(runner, "last_new_tokens", None)
+            if new_toks is not None:
+                timing[role]["new_tokens"] += new_toks
+                timing[role]["_has_tokens"] = True
+
+            gen_cache.put(cache_key, response)
+            response_memo[mem_key] = response
+
+            split = "val" if item_id in val_id_set else "test"
+            if item_id not in generations[split]:
+                generations[split][item_id] = {}
+            generations[split][item_id][role] = response
+            return response
+
+        # Score cache (item_id, role) -> float
+        score_cache: dict[tuple[str, str], float] = {}
 
         def score_fn(item: dict, role: str) -> float:
             item_id = str(item["id"])
             key = (item_id, role)
             if key in score_cache:
                 return score_cache[key]
-
-            query = data.build_query(item)
-            response = runners[role].generate(query, role)
-
-            split = "val" if item_id in val_id_set else "test"
-            if item_id not in generations[split]:
-                generations[split][item_id] = {}
-            generations[split][item_id][role] = response
-
+            response = generate_response(runners[role], item, role)
             sc = evaluator.score_response(item, response)
             score_cache[key] = sc
             return sc
 
+        # Step e: Role-major pre-generation phase
+        skip_calibration = getattr(args, "skip_calibration", False)
+        items_to_generate = val_items + test_items if not skip_calibration else test_items
+
+        for role in config.ROLES:
+            runner = runners[role]
+            try:
+                runner.load()
+                for item in items_to_generate:
+                    generate_response(runner, item, role)
+            except RuntimeError as e:
+                sys.stderr.write(
+                    f"RuntimeError loading/running {role} runner: {e}. "
+                    "Try --device cpu or a smaller --scale.\n"
+                )
+                return 2
+            finally:
+                runner.unload()
+
         # Step f: Router calibration or loading
-        if not getattr(args, "skip_calibration", False):
+        if not skip_calibration:
             r = router.EmbeddingRouter(
                 embedding_model_name=config.EMBEDDING_MODEL,
                 n_clusters=config.N_CLUSTERS,
@@ -171,10 +300,9 @@ def run(
         # Step h: Write outputs into run_dir
         if args.mock:
             models.MockRunner.assert_mock_path(str(run_dir))
-            for fn in ("metrics.json", "records.json", "calibration.json", "generations.json", "run_config.json"):
+            for fn in ("metrics.json", "records.json", "calibration.json", "generations.json",
+                       "run_config.json", "timing.json"):
                 models.MockRunner.assert_mock_path(str(run_dir / fn))
-
-        run_dir.mkdir(parents=True, exist_ok=True)
 
         with open(run_dir / "metrics.json", "w", encoding="utf-8") as f:
             json.dump(metrics, f, indent=2)
@@ -187,6 +315,29 @@ def run(
 
         with open(run_dir / "generations.json", "w", encoding="utf-8") as f:
             json.dump(generations, f, indent=2)
+
+        # Build timing.json
+        timing_out: dict[str, dict[str, Any]] = {}
+        for role, t in timing.items():
+            n_gen = t["n_generated"]
+            n_cached = t["n_cached"]
+            seconds = t["seconds"]
+            new_toks = t["new_tokens"] if t["_has_tokens"] else None
+
+            sec_per_gen = (seconds / n_gen) if n_gen > 0 else None
+            tokens_per_sec = (new_toks / seconds) if (new_toks and seconds > 0) else None
+
+            timing_out[role] = {
+                "n_generated": n_gen,
+                "n_cached": n_cached,
+                "seconds": seconds,
+                "sec_per_generation": sec_per_gen,
+                "new_tokens": new_toks,
+                "tokens_per_sec": tokens_per_sec,
+            }
+
+        with open(run_dir / "timing.json", "w", encoding="utf-8") as f:
+            json.dump(timing_out, f, indent=2)
 
         # Build run_config.json
         git_hash = None
@@ -203,7 +354,14 @@ def run(
         except Exception:
             git_hash = None
 
-        embedding_name = "hash_embed" if (embed_fn is not None or getattr(args, "mock", False)) else config.EMBEDDING_MODEL
+        embedding_name = (
+            "hash_embed"
+            if (embed_fn is not None or getattr(args, "mock", False))
+            else config.EMBEDDING_MODEL
+        )
+
+        # Collect runner descriptions after generation phase
+        runner_descriptions = {role: runners[role].describe() for role in config.ROLES}
 
         args_dict = vars(args) if hasattr(args, "__dict__") else dict(args)
         run_config: dict[str, Any] = {
@@ -218,6 +376,9 @@ def run(
             "version": src.__version__,
             "git_commit": git_hash,
             "python_version": sys.version,
+            "device": device,
+            "val_limit": val_limit,
+            "runner_describe": runner_descriptions,
         }
         if args.scale == "0.5b":
             run_config["size_confound_note"] = config.SIZE_CONFOUND_NOTE
@@ -233,6 +394,9 @@ def run(
         oracle_acc = metrics["oracle"]["acc"]
         routing_counts = metrics["routing_counts"]
 
+        total_cached = sum(t["n_cached"] for t in timing.values())
+        total_generated = sum(t["n_generated"] for t in timing.values())
+
         print(
             f"Run summary ({args.scale}, benchmark={args.benchmark}, mock={args.mock}):\n"
             f"  Routed accuracy   : {routed_acc:.4f}\n"
@@ -241,6 +405,7 @@ def run(
             f"  McNemar p-value   : {mcnemar_p:.4f}\n"
             f"  Oracle accuracy   : {oracle_acc:.4f}\n"
             f"  Routing counts    : {routing_counts}\n"
+            f"  Generations (new/cached): {total_generated}/{total_cached}\n"
             f"  Run directory     : {run_dir}"
         )
         return 0
@@ -252,9 +417,6 @@ def run(
             )
         else:
             sys.stderr.write(f"Data file not found: {e}\n")
-        return 2
-    except NotImplementedError:
-        sys.stderr.write("Real HuggingFace/Ollama backends are not implemented yet, use --mock\n")
         return 2
     except ValueError as e:
         sys.stderr.write(f"Validation error: {e}\n")

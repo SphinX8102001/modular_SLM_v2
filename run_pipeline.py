@@ -1,4 +1,4 @@
-"""run_pipeline.py — CLI skeleton for the Modular SLM pipeline (round 0)."""
+"""run_pipeline.py — CLI for the Modular SLM pipeline (round 5)."""
 
 import argparse
 import sys
@@ -49,6 +49,18 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["smoke", "real"],
         default="smoke",
         help="Benchmark mode: smoke (fast, mock-safe) or real.",
+    )
+    p.add_argument(
+        "--device",
+        choices=["cpu", "cuda"],
+        default="cpu",
+        help="Device for HuggingFace inference: cpu or cuda.",
+    )
+    p.add_argument(
+        "--val-limit",
+        type=int,
+        default=None,
+        help="Debugging only: cap the number of validation items used for calibration.",
     )
     return p
 

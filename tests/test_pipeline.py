@@ -1,12 +1,13 @@
-"""tests/test_pipeline.py — placeholder test suite (round 4)."""
+"""tests/test_pipeline.py — placeholder test suite (round 5)."""
 
 import argparse
 import inspect
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Callable
 import numpy as np
 import pytest
 import src
@@ -184,11 +185,7 @@ class TestModelRunnerRound1:
         models.MockRunner.assert_mock_path("/x/artifacts_mock/run.json")
 
     def test_real_runners_generate_raises_not_implemented(self) -> None:
-        """Calling generate() on HuggingFaceRunner or OllamaRunner raises NotImplementedError."""
-        hf = models.HuggingFaceRunner("hf-id", "general", "1.5b")
-        with pytest.raises(NotImplementedError):
-            hf.generate("query", "general")
-
+        """Calling generate() on OllamaRunner raises NotImplementedError."""
         ol = models.OllamaRunner("ol-id", "math", "0.5b")
         with pytest.raises(NotImplementedError):
             ol.generate("query", "math")
@@ -844,6 +841,8 @@ class TestRound4PipelineExecution:
             "skip_calibration": False,
             "seed": 7,
             "benchmark": "smoke",
+            "device": "cpu",
+            "val_limit": None,
         }
         defaults.update(kwargs)
         return argparse.Namespace(**defaults)
@@ -856,9 +855,10 @@ class TestRound4PipelineExecution:
         run_dir = self.results_mock / "0.5b_smoke_seed7"
         assert run_dir.is_dir()
 
-        # All 5 files in run_dir + router_state.json in artifacts_mock
-        for fname in ["metrics.json", "records.json", "calibration.json", "generations.json", "run_config.json"]:
-            assert (run_dir / fname).is_file()
+        # All 5 required files in run_dir + timing.json + generation_cache.jsonl + router_state.json
+        for fname in ["metrics.json", "records.json", "calibration.json", "generations.json",
+                      "run_config.json", "timing.json", "generation_cache.jsonl"]:
+            assert (run_dir / fname).is_file(), f"Missing: {fname}"
         assert (self.artifacts_mock / "router_state.json").is_file()
 
         # Records check
@@ -963,7 +963,7 @@ class TestRound4PipelineExecution:
             def is_mock(self) -> bool:
                 return True
 
-        def oracle_factory(backend: str, model_id: str, role: str, scale: str, is_mock: bool) -> models.ModelRunner:
+        def oracle_factory(backend: str, model_id: str, role: str, scale: str, is_mock: bool, device: str = "cpu") -> models.ModelRunner:
             return OracleRunner(role=role)
 
         args = self._default_args()
@@ -993,10 +993,18 @@ class TestRound4PipelineExecution:
         args = self._default_args(benchmark="real")
         assert pipeline.run(args) == 2
 
-    def test_mock_false_not_implemented(self) -> None:
-        args = self._default_args(mock=False, backend="huggingface")
-        ret = pipeline.run(args, embed_fn=pipeline.hash_embed)
+    def test_mock_false_preflight_ollama(self) -> None:
+        """mock=False with backend 'ollama' returns 2 at preflight; embed_fn must never be called."""
+        embed_calls = [0]
+
+        def counting_embed(texts: list[str]) -> np.ndarray:
+            embed_calls[0] += 1
+            return pipeline.hash_embed(texts)
+
+        args = self._default_args(mock=False, backend="ollama")
+        ret = pipeline.run(args, embed_fn=counting_embed)
         assert ret == 2
+        assert embed_calls[0] == 0
 
     def test_assert_mock_path_root_relative(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(config, "ROOT_DIR", Path("/home/u/results/proj"))
@@ -1031,3 +1039,393 @@ class TestRound4PipelineExecution:
         )
         assert res_real.returncode == 2
         assert len(res_real.stderr.strip()) > 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Round 5 tests: models, cache, pipeline behaviour
+# ──────────────────────────────────────────────────────────────────────────────
+
+import src.cache as cache_mod
+
+
+class TestRound5Models:
+    """Verify HuggingFaceRunner helpers, cache, and role-major pipeline behaviour."""
+
+    def test_resolve_dtype_name(self) -> None:
+        hf = models.HuggingFaceRunner("m", "general", "1.5b", device="cpu")
+        assert hf.resolve_dtype_name("cpu", None) == "float32"
+        assert hf.resolve_dtype_name("cuda", None) == "float16"
+        assert hf.resolve_dtype_name("cpu", "bfloat16") == "bfloat16"
+        assert hf.resolve_dtype_name("cuda", "float32") == "float32"
+
+    def test_build_generation_kwargs(self) -> None:
+        for role, expected_max in [("general", 256), ("math", 512), ("code", 256)]:
+            kw = models.build_generation_kwargs(role)
+            assert kw["max_new_tokens"] == expected_max
+            assert kw["do_sample"] is False
+            assert "repetition_penalty" in kw
+            assert "temperature" not in kw
+
+    def test_hf_runner_stores_device_dtype(self) -> None:
+        hf = models.HuggingFaceRunner("m", "general", "1.5b", device="cpu", dtype="float32")
+        assert hf.device == "cpu"
+        assert hf.dtype == "float32"
+        assert hf._model is None
+        assert hf._tokenizer is None
+        assert hf.last_new_tokens is None
+
+    def test_hf_runner_bad_device_dtype(self) -> None:
+        with pytest.raises(ValueError, match="device"):
+            models.HuggingFaceRunner("m", "general", "1.5b", device="tpu")
+        with pytest.raises(ValueError, match="dtype"):
+            models.HuggingFaceRunner("m", "general", "1.5b", dtype="int8")
+
+    def test_hf_runner_no_torch_at_import(self) -> None:
+        """Importing src.models must not load torch."""
+        code = (
+            "import sys; import src.models; "
+            "print('torch' in sys.modules)"
+        )
+        out = subprocess.check_output([sys.executable, "-c", code], text=True).strip()
+        assert out == "False"
+
+    def test_get_runner_passes_device(self) -> None:
+        """get_runner passes device to HuggingFaceRunner."""
+        r = models.get_runner("huggingface", "m", "general", "1.5b", is_mock=False, device="cpu")
+        assert isinstance(r, models.HuggingFaceRunner)
+        assert r.device == "cpu"
+
+        # mock ignores device
+        rm = models.get_runner("huggingface", "m", "general", "1.5b", is_mock=True, device="cpu")
+        assert isinstance(rm, models.MockRunner)
+
+    def test_get_runner_signature(self) -> None:
+        sig = inspect.signature(models.get_runner)
+        params = list(sig.parameters)
+        assert params == ["backend", "model_id", "role", "scale", "is_mock", "device"]
+        assert sig.parameters["device"].default == "cpu"
+
+    def test_load_unload_describe_noop_on_mock(self) -> None:
+        """MockRunner.load/unload/describe are inherited no-ops from ModelRunner."""
+        r = models.MockRunner("m", "general", "1.5b")
+        r.load()   # must not raise
+        r.unload()  # must not raise
+        assert r.describe() == {}
+
+
+class TestRound5Cache:
+    """Verify GenerationCache and make_key."""
+
+    def test_put_get_roundtrip(self, tmp_path: Path) -> None:
+        c = cache_mod.GenerationCache(tmp_path / "cache.jsonl")
+        c.put("k1", "response one")
+        assert c.get("k1") == "response one"
+        assert c.get("k_missing") is None
+
+    def test_second_instance_sees_data(self, tmp_path: Path) -> None:
+        path = tmp_path / "cache.jsonl"
+        c1 = cache_mod.GenerationCache(path)
+        c1.put("k1", "hello")
+        c2 = cache_mod.GenerationCache(path)
+        assert c2.get("k1") == "hello"
+
+    def test_truncated_last_line_skipped(self, tmp_path: Path) -> None:
+        import json as _json
+        path = tmp_path / "cache.jsonl"
+        # Write a valid line then a truncated/malformed line
+        path.write_text(
+            '{"key": "k1", "response": "good"}\n{"key": "k2',
+            encoding="utf-8",
+        )
+        c = cache_mod.GenerationCache(path)
+        assert c.get("k1") == "good"
+        assert c.get("k2") is None  # truncated line skipped
+
+    def test_make_key_differs_on_inputs(self) -> None:
+        runner = models.MockRunner("model-a", "general", "1.5b")
+        base_kw = {"max_new_tokens": 256, "do_sample": False, "repetition_penalty": 1.05}
+
+        key_base = cache_mod.make_key(runner, "general", "sys-prompt", base_kw, "query")
+
+        # Different system prompt
+        assert cache_mod.make_key(runner, "general", "other-prompt", base_kw, "query") != key_base
+        # Different query
+        assert cache_mod.make_key(runner, "general", "sys-prompt", base_kw, "other-query") != key_base
+        # Different role
+        assert cache_mod.make_key(runner, "math", "sys-prompt", base_kw, "query") != key_base
+        # Different gen_settings
+        assert cache_mod.make_key(runner, "general", "sys-prompt", {**base_kw, "max_new_tokens": 512}, "query") != key_base
+
+        # device / dtype: use a HuggingFaceRunner and check different device gives different key
+        hf_cpu = models.HuggingFaceRunner("model-a", "general", "1.5b", device="cpu")
+        hf_cuda_sim = models.HuggingFaceRunner("model-a", "general", "1.5b", device="cpu", dtype="float16")
+        key_cpu = cache_mod.make_key(hf_cpu, "general", "sys-prompt", base_kw, "query")
+        key_cuda = cache_mod.make_key(hf_cuda_sim, "general", "sys-prompt", base_kw, "query")
+        assert key_cpu != key_cuda
+
+
+class TestRound5PipelineBehaviour:
+    """Role-major, cache, resume, val_limit, timing, and RuntimeError tests."""
+
+    @pytest.fixture(autouse=True)
+    def setup_dirs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        self.tmp_path = tmp_path
+        self.results_mock = tmp_path / "results_mock"
+        self.artifacts_mock = tmp_path / "artifacts_mock"
+        self.results_prod = tmp_path / "results"
+        self.artifacts_prod = tmp_path / "artifacts"
+        self.router_state_file = self.artifacts_prod / "router_state.json"
+
+        monkeypatch.setattr(config, "RESULTS_MOCK_DIR", self.results_mock)
+        monkeypatch.setattr(config, "ARTIFACTS_MOCK_DIR", self.artifacts_mock)
+        monkeypatch.setattr(config, "RESULTS_DIR", self.results_prod)
+        monkeypatch.setattr(config, "ARTIFACTS_DIR", self.artifacts_prod)
+        monkeypatch.setattr(config, "ROUTER_STATE_FILE", self.router_state_file)
+
+    def _default_args(self, **kwargs: Any) -> argparse.Namespace:
+        defaults: dict[str, Any] = {
+            "scale": "0.5b",
+            "backend": "huggingface",
+            "mock": True,
+            "limit": None,
+            "skip_calibration": False,
+            "seed": 7,
+            "benchmark": "smoke",
+            "device": "cpu",
+            "val_limit": None,
+        }
+        defaults.update(kwargs)
+        return argparse.Namespace(**defaults)
+
+    def _spy_factory(self) -> tuple[Callable[..., models.ModelRunner], list]:
+        """Return (factory, event_log). factory builds spy runners that log load/generate/unload."""
+        event_log: list[tuple[str, str]] = []
+
+        class SpyRunner(models.ModelRunner):
+            def __init__(self, role: str) -> None:
+                self.role = role
+                self.model_id = f"spy-{role}"
+
+            def load(self) -> None:
+                event_log.append(("load", self.role))
+
+            def unload(self) -> None:
+                event_log.append(("unload", self.role))
+
+            def _raw_generate(self, query: str, system_prompt: str, role: str) -> str:
+                event_log.append(("generate", role))
+                return f"MOCK_PLACEHOLDER [role={role}] not answered"
+
+            def is_mock(self) -> bool:
+                return True
+
+        def factory(backend: str, model_id: str, role: str, scale: str, is_mock: bool, device: str = "cpu") -> models.ModelRunner:
+            return SpyRunner(role=role)
+
+        return factory, event_log
+
+    def test_role_major_ordering(self) -> None:
+        """Each role is loaded once; all generates for that role are between load and unload."""
+        factory, events = self._spy_factory()
+        args = self._default_args()
+        ret = pipeline.run(args, runner_factory=factory, embed_fn=pipeline.hash_embed)
+        assert ret == 0
+
+        # Exactly 3 loads/unloads (one per role)
+        loads = [(e, r) for e, r in events if e == "load"]
+        unloads = [(e, r) for e, r in events if e == "unload"]
+        assert len(loads) == 3, f"Expected 3 loads, got: {events}"
+        assert len(unloads) == 3
+        assert [r for _, r in loads] == config.ROLES
+        assert [r for _, r in unloads] == config.ROLES
+
+        # No two roles loaded at the same time
+        loaded = set()
+        for ev, role in events:
+            if ev == "load":
+                assert role not in loaded, f"Role {role!r} loaded twice without unload"
+                loaded.add(role)
+            elif ev == "unload":
+                loaded.discard(role)
+
+        # Total generate calls == 3 * (n_val + n_test)
+        val_items = data.load_items(data.dataset_paths("smoke")[0])
+        test_items = data.load_items(data.dataset_paths("smoke")[1])
+        expected_gens = 3 * (len(val_items) + len(test_items))
+        actual_gens = sum(1 for e, _ in events if e == "generate")
+        assert actual_gens == expected_gens
+
+        # All generates for a role fall between that role's load and unload
+        for role in config.ROLES:
+            load_idx = next(i for i, (e, r) in enumerate(events) if e == "load" and r == role)
+            unload_idx = next(i for i, (e, r) in enumerate(events) if e == "unload" and r == role)
+            for i, (ev, r) in enumerate(events):
+                if ev == "generate" and r == role:
+                    assert load_idx < i < unload_idx, (
+                        f"Generate for {role!r} at index {i} is outside load({load_idx})/unload({unload_idx}) window"
+                    )
+
+    def test_resume_zero_generates_on_second_run(self) -> None:
+        """Second identical run makes 0 generate calls and produces identical metrics."""
+        factory, events = self._spy_factory()
+        args = self._default_args()
+
+        ret = pipeline.run(args, runner_factory=factory, embed_fn=pipeline.hash_embed)
+        assert ret == 0
+        gen_count_first = sum(1 for e, _ in events if e == "generate")
+        assert gen_count_first > 0
+        metrics_first = (self.results_mock / "0.5b_smoke_seed7" / "metrics.json").read_text(encoding="utf-8")
+
+        # Second run
+        factory2, events2 = self._spy_factory()
+        ret2 = pipeline.run(args, runner_factory=factory2, embed_fn=pipeline.hash_embed)
+        assert ret2 == 0
+        gen_count_second = sum(1 for e, _ in events2 if e == "generate")
+        assert gen_count_second == 0, f"Expected 0 generates on second run, got {gen_count_second}"
+
+        metrics_second = (self.results_mock / "0.5b_smoke_seed7" / "metrics.json").read_text(encoding="utf-8")
+        assert metrics_first == metrics_second
+
+        timing = json.loads((self.results_mock / "0.5b_smoke_seed7" / "timing.json").read_text(encoding="utf-8"))
+        for role in config.ROLES:
+            assert timing[role]["n_cached"] > 0
+            assert timing[role]["n_generated"] == 0
+
+    def test_resume_repromt_regenerates_changed_role(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Changing system prompt for one role causes only that role to regenerate."""
+        factory, events = self._spy_factory()
+        args = self._default_args()
+        assert pipeline.run(args, runner_factory=factory, embed_fn=pipeline.hash_embed) == 0
+
+        # Change system prompt for 'math' only
+        original_math_prompt = config.SYSTEM_PROMPTS["math"]
+        monkeypatch.setitem(config.SYSTEM_PROMPTS, "math", "CHANGED MATH PROMPT")
+
+        factory2, events2 = self._spy_factory()
+        assert pipeline.run(args, runner_factory=factory2, embed_fn=pipeline.hash_embed) == 0
+
+        generates_by_role: dict[str, int] = {}
+        for ev, r in events2:
+            if ev == "generate":
+                generates_by_role[r] = generates_by_role.get(r, 0) + 1
+
+        assert generates_by_role.get("math", 0) > 0, "math should regenerate after prompt change"
+        assert generates_by_role.get("general", 0) == 0
+        assert generates_by_role.get("code", 0) == 0
+
+    def test_skip_calibration_warm_cache_no_generates(self) -> None:
+        """skip_calibration with warm cache generates nothing."""
+        factory, events = self._spy_factory()
+        args_init = self._default_args()
+        assert pipeline.run(args_init, runner_factory=factory, embed_fn=pipeline.hash_embed) == 0
+
+        factory2, events2 = self._spy_factory()
+        args_skip = self._default_args(skip_calibration=True)
+        assert pipeline.run(args_skip, runner_factory=factory2, embed_fn=pipeline.hash_embed) == 0
+        assert sum(1 for e, _ in events2 if e == "generate") == 0
+
+    def test_skip_calibration_cold_cache_generates_test_only(self) -> None:
+        """skip_calibration with NO cache: only test items are generated (no val items)."""
+        # First do a normal run to get the router state
+        factory_init, _ = self._spy_factory()
+        args_init = self._default_args()
+        assert pipeline.run(args_init, runner_factory=factory_init, embed_fn=pipeline.hash_embed) == 0
+
+        # Delete the cache so the next run has a cold cache
+        cache_file = self.results_mock / "0.5b_smoke_seed7" / "generation_cache.jsonl"
+        cache_file.unlink()
+
+        factory2, events2 = self._spy_factory()
+        args_skip = self._default_args(skip_calibration=True)
+        assert pipeline.run(args_skip, runner_factory=factory2, embed_fn=pipeline.hash_embed) == 0
+
+        gen_count = sum(1 for e, _ in events2 if e == "generate")
+        test_items = data.load_items(data.dataset_paths("smoke")[1])
+        # Only test items × 3 roles should have been generated
+        assert gen_count == 3 * len(test_items), f"Expected {3 * len(test_items)}, got {gen_count}"
+
+    def test_val_limit_5(self) -> None:
+        """val_limit=5 uses only 5 val items for calibration."""
+        args = self._default_args(val_limit=5)
+        assert pipeline.run(args, embed_fn=pipeline.hash_embed) == 0
+        calibration = json.loads(
+            (self.results_mock / "0.5b_smoke_seed7" / "calibration.json").read_text(encoding="utf-8")
+        )
+        assert calibration["n_items"] == 5
+
+    def test_val_limit_too_small_returns_2(self) -> None:
+        """val_limit < N_CLUSTERS returns exit code 2."""
+        args = self._default_args(val_limit=1)
+        assert pipeline.run(args) == 2
+
+    def test_timing_json_fields(self) -> None:
+        """timing.json contains the expected fields per role."""
+        args = self._default_args()
+        assert pipeline.run(args, embed_fn=pipeline.hash_embed) == 0
+        timing = json.loads(
+            (self.results_mock / "0.5b_smoke_seed7" / "timing.json").read_text(encoding="utf-8")
+        )
+        for role in config.ROLES:
+            assert role in timing
+            t = timing[role]
+            for field in ["n_generated", "n_cached", "seconds", "sec_per_generation",
+                          "new_tokens", "tokens_per_sec"]:
+                assert field in t, f"Missing field {field!r} in timing[{role!r}]"
+
+    def test_run_config_new_fields(self) -> None:
+        """run_config.json contains device, val_limit, and runner_describe."""
+        args = self._default_args()
+        assert pipeline.run(args, embed_fn=pipeline.hash_embed) == 0
+        cfg = json.loads(
+            (self.results_mock / "0.5b_smoke_seed7" / "run_config.json").read_text(encoding="utf-8")
+        )
+        assert "device" in cfg
+        assert "val_limit" in cfg
+        assert "runner_describe" in cfg
+
+    def test_runtime_error_from_load_returns_2(self) -> None:
+        """RuntimeError raised by runner.load() during the generation phase returns exit code 2."""
+        class CrashRunner(models.ModelRunner):
+            def __init__(self, role: str) -> None:
+                self.role = role
+                self.model_id = "crash-model"
+
+            def load(self) -> None:
+                raise RuntimeError("Simulated CUDA OOM")
+
+            def _raw_generate(self, query: str, system_prompt: str, role: str) -> str:
+                return "never"
+
+            def is_mock(self) -> bool:
+                return True
+
+        def crash_factory(backend: str, model_id: str, role: str, scale: str, is_mock: bool, device: str = "cpu") -> models.ModelRunner:
+            return CrashRunner(role=role)
+
+        args = self._default_args()
+        assert pipeline.run(args, runner_factory=crash_factory, embed_fn=pipeline.hash_embed) == 2
+
+    def test_import_hygiene_round5(self) -> None:
+        """import src.models, src.pipeline leaves torch/transformers/sentence_transformers out of sys.modules."""
+        code = (
+            "import sys; import src.models, src.pipeline; "
+            "print('torch' in sys.modules, 'transformers' in sys.modules, "
+            "'sentence_transformers' in sys.modules)"
+        )
+        out = subprocess.check_output([sys.executable, "-c", code], text=True).strip()
+        assert out == "False False False"
+
+    @pytest.mark.skipif(
+        not os.environ.get("RUN_REAL_MODEL_TESTS"),
+        reason="Set RUN_REAL_MODEL_TESTS=1 to run real model tests",
+    )
+    def test_hf_runner_real_model(self) -> None:  # pragma: no cover
+        """Opt-in: verify HuggingFaceRunner can generate and unload a real 0.5B model."""
+        hf = models.HuggingFaceRunner(
+            "Qwen/Qwen2.5-0.5B-Instruct", "general", "0.5b", device="cpu"
+        )
+        response = hf.generate("What is 2+2?", "general")
+        assert isinstance(response, str) and len(response.strip()) > 0
+        hf.unload()
+        assert hf._model is None
+        assert hf._tokenizer is None
